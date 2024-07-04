@@ -1,0 +1,141 @@
+with
+filter as
+(
+    select
+          @today := date(now() + interval 7 hour) - interval 7 hour as today
+        , @start_close_n1 :=
+            case when now() > @today + interval 9 hour then @today + interval 10 hour - interval 1 day else @today + interval 10 hour - interval 2 day end as start_close_n1
+        , @end_close_n1 := @start_close_n1 + interval 21 hour as end_close_n1
+        , @start_close_n0 := @start_close_n1 + interval 1 day as start_close_n0
+        , @end_close_n0 := @end_close_n1 + interval 1 day as end_close_n0
+        
+        , @start_sort_n1 :=
+            case when now() > @today + interval 9 hour then @today - interval 17 hour else @today + interval 7 hour end as start_sort_n1
+        -- , @end_sort_n1 := @start_sort_n1 + interval 1 day as end_sort_n1
+        -- , @start_sort_n0 := @start_sort_n1 + interval 1 day as start_sort_n0
+        -- , @end_sort_n0 := @end_sort_n1 + interval 1 day as end_sort_n0
+)
+-- select * from filter
+
+, hubs as
+(
+    select
+          h.hub_id
+        , h.name
+        , @region_id :=
+            case when SUBSTRING_INDEX(h.name, " - ", 1) in ('QUB', 'QUT', 'TTH') then 103 else h.region_id end as region_id
+        , @region_name :=
+            case when SUBSTRING_INDEX(h.name, " - ", 1) in ('QUB', 'QUT', 'TTH') then 'South' else h.region_name end as region_name
+        , @local_bus_flag := COALESCE(lb.local_bus_flag, 0) as local_bus_flag
+        , @inbound_route :=
+            case    when h.hub_id = 15 then 'Inbound - WH pickup'
+                    when @region_id in (91,103) then 'Inbound - Interzone'
+                    when @region_id = 101 then 'Inbound - North'
+                    when @region_id = 89 then 'Inbound - HN DPs'
+            end as inbound_route
+        , @outbound_route :=
+            case    when h.hub_id = 1 then 'Holding - OOZ'
+                    when h.hub_id in (1111,1200,103844,104144) then 'Holding Overcap'
+                    when h.hub_id = 1102 then 'Sorting - SORT 3'
+                    when h.hub_id = 70 then 'Outbound - HN Reco'
+                    when @region_id = 89 then 'Outbound - HN'
+                    when @region_id = 101 then IF(@local_bus_flag = 1, 'Outbound - Local Bus', 'Outbound - Inhouse')
+                    when @region_id in (91, 103) then 'Outbound - Interzone'
+            end as outbound_route
+    from sort_prod_gl.hubs h
+    left join (
+            select hub_id, 1 as local_bus_flag
+            from addressing_prod_gl.zones where system_id = 'vn'
+            and SUBSTRING(short_name, 1, 3) = '2-9'
+            GROUP BY hub_id
+            ) lb on h.hub_id = lb.hub_id
+    where h.system_id = 'vn'
+)
+-- select * from hubs
+
+, wh_shipments as
+(
+    select
+          id as shipment_id
+        , status
+        , comments
+        , dest_hub_id
+        -- , created_at
+        , case
+            when user_id = 'HN-Offload' then 'offload'
+            when dest_hub_id = 1102 then IF(UPPER(comments) LIKE '%BAO%', 'adding', 'sorting')
+            when dest_hub_id IN (1111, 104144) then 'overcap'
+            when status != 'Cancelled' then 'outbound'
+            else 'sorting'
+          end as shipment_type
+    from hub_prod_gl.shipments
+    where orig_hub_id = 15
+    and orig_hub_country = 'vn'
+    and created_at >= (select start_sort_n1 from filter) - interval 1 week
+)
+-- select * from wh_shipments
+
+, last_close as
+(
+    select
+          *
+    from
+    (
+        select
+              se.shipment_id
+            , se.created_at + interval 7 hour as created_at
+            , case
+                when se.created_at between filter.start_close_n1 and filter.end_close_n1 then 'outbound_n1'
+                when se.created_at between filter.start_close_n0 and filter.end_close_n0 then 'outbound_n0'
+                else 'others'
+              end as outbound_type
+            , case
+                when se.created_at between filter.start_close_n1 and filter.end_close_n1 then date(filter.start_close_n1 + interval 7 hour)
+                when se.created_at between filter.start_close_n0 and filter.end_close_n0 then date(filter.start_close_n0 + interval 7 hour)
+                else null
+              end as dimdate
+            , case
+                when se.created_at between date(se.created_at + interval 7 hour) + interval 2 hour
+                        and date(se.created_at + interval 7 hour) + interval 6 hour then 1 else 0
+              end as sameday_flag
+            , se.id = MAX(se.id) OVER(PARTITION BY se.shipment_id) as last_flag
+        from hub_prod_gl.shipment_events se
+        join filter
+        where se.event = 'SHIPMENT_CLOSED' and se.status = 'CLOSED'
+        and se.shipment_id IN (select shipment_id from wh_shipments where shipment_type IN ('offload', 'overcap', 'outbound'))
+        and se.hub_system_id = 'vn'
+    ) se
+    where last_flag = 1
+    and outbound_type IN ('outbound_n1', 'outbound_n0')
+)
+-- select * from last_close
+
+select
+      date_format(now() + interval 7 hour, '%Y-%m-%d %H:%i') as datetime_run
+    , last_close.outbound_type
+    , last_close.dimdate
+    , date_format(last_close.created_at, '%Y-%m-%d %H:%i:%s') as close_datetime
+    -- , '' as close_datetime
+    , wh_shipments.shipment_id
+    , wh_shipments.status
+    , wh_shipments.comments
+    , wh_shipments.dest_hub_id
+    , hubs.name as dest_hub_name
+    , case
+        when wh_shipments.shipment_type = 'offload' then 'Holding - Offload'
+        else hubs.outbound_route
+      end as outbound_route
+    , case
+        when hubs.outbound_route = 'Outbound - HN' and last_close.sameday_flag = 1 then 1 else 0
+      end as sameday_flag
+    , so.order_id
+    , date_format(so.created_at + interval 7 hour, '%Y-%m-%dT%H:%i:%s') as ats_datetime
+from wh_shipments
+join last_close on wh_shipments.shipment_id = last_close.shipment_id
+join hubs on wh_shipments.dest_hub_id = hubs.hub_id
+join (
+    select shipment_id, order_id, created_at
+    from hub_prod_gl.shipment_orders
+    where shipment_id IN (select shipment_id from last_close)
+    and order_country = 'vn' and deleted_at is null
+    ) so on wh_shipments.shipment_id = so.shipment_id
