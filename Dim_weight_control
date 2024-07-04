@@ -1,0 +1,144 @@
+WITH wh_ib_raw AS (
+    select
+        i.order_id
+    from inbound_scans i
+    where case
+            when now() >= curdate() - interval 2 hour then i.created_at >= curdate() - interval 7 hour and i.created_at <= curdate() + interval 1 day + interval 4 hour
+            when now() < curdate() - interval 2 hour then i.created_at >= curdate() - interval 7 hour - interval 1 day and i.created_at <= curdate() + interval 4 hour
+        end
+        /*
+        Logic lấy đơn:
+        - trước 5h ngày N, scan từ 0h N-1 đến 4h N
+        - sau 5h ngày N, scan từ 0h N đến 4h N+1
+        - hub inbound scan tại WH
+        */
+        and i.type = 2
+        and i.hub_id = 12
+        and i.route_id is null
+    group by 1
+)
+
+, ord_evt AS (
+    select
+        distinct
+        oe.order_id
+        , oe.user_id
+        , oe.user_name
+        , CASE
+            WHEN REPLACE(JSON_EXTRACT(oe.data, '$.device_id'), '"', '') IS NULL THEN 'sort_app'
+            ELSE REPLACE(JSON_EXTRACT(oe.data, '$.device_id'), '"', '')
+          END AS device_id
+        , CASE
+              WHEN oe.user_id = 11950191 THEN 'VNDWS'
+              WHEN REPLACE(JSON_EXTRACT(oe.data, '$.device_id'), '"', '') IS NULL THEN IF(oe.user_id in (40822182, 40856590, 40822192, 40869146, 40869150, 40856586, 40766690), 'inbound_photos', 'manual')
+              ELSE 'Raspberry'
+        END AS device_type
+        , JSON_EXTRACT(oe.data, '$.parcel_size_id.old_value') AS from_size_id
+        , JSON_EXTRACT(oe.data, '$.parcel_size_id.new_value') AS to_size_id
+        
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.weight.new_value') AS DECIMAL(10, 6))) AS wh_weight
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.length.new_value') AS DECIMAL(10, 6)))
+          * ABS(CAST(JSON_EXTRACT(oe.data, '$.width.new_value') AS DECIMAL(10, 6)))
+          * ABS(CAST(JSON_EXTRACT(oe.data, '$.height.new_value') AS DECIMAL(10, 6))) / 6000 AS wh_dim
+          
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_weight') AS DECIMAL(10, 6))) AS raw_weight
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_length') AS DECIMAL(10, 6))) AS raw_length
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_width') AS DECIMAL(10, 6))) AS raw_width
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_height') AS DECIMAL(10, 6))) AS raw_height
+        
+        , ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_length') AS DECIMAL(10, 6)))
+          * ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_width') AS DECIMAL(10, 6)))
+          * ABS(CAST(JSON_EXTRACT(oe.data, '$.raw_height') AS DECIMAL(10, 6))) / 6000 AS raw_dim
+        , date_format(oe.created_at + INTERVAL 7 HOUR, '%Y-%m-%d') AS inbound_date
+        , oe.created_at -- 16
+        , oe.created_at = MAX(oe.created_at) OVER(PARTITION BY oe.order_id) as latest_inb_flag -- last_created_at
+        , FIRST_VALUE(oe.created_at) OVER(PARTITION BY oe.order_id ORDER BY oe.created_at) as first_glo_inb_datetime
+    from events_prod_gl.order_events oe -- use index(index_system_id_order_id, index_system_id_order_id, fk_type_id)
+    where oe.order_id IN (select order_id from wh_ib_raw)
+        and oe.system_id = 'vn'
+        and oe.type = 26
+        and case
+            when now() >= curdate() - interval 2 hour then oe.created_at >= curdate() - interval 7 hour and oe.created_at <= curdate() + interval 1 day + interval 4 hour
+            when now() < curdate() - interval 2 hour then oe.created_at >= curdate() - interval 7 hour - interval 1 day and oe.created_at <= curdate() + interval 4 hour
+        end
+        and REPLACE(JSON_EXTRACT(oe.data, '$.hub_id'), '"', '') = 12
+    -- group by 1, 2, 3, 4 , 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+)
+
+select
+    ord_evt.order_id
+    , o.tracking_id
+    , CASE
+        WHEN fs.id IS NULL THEN 1 ELSE 2
+    END AS wh_sequence
+    , o.rts
+    , o.status
+    , o.granular_status
+    , o.shipper_id
+    , o.parcel_size_id
+    -- , o.billing_weight
+    , o.sp_weight
+    , o.sp_dim
+    , date_format(ord_evt.created_at + interval 7 hour, '%Y-%m-%d %H:%i:%s') as global_inb_at
+    , ord_evt.user_id
+    , ord_evt.user_name
+    , ord_evt.device_id
+    , ord_evt.device_type
+    , ord_evt.from_size_id
+    , ord_evt.to_size_id
+    , ord_evt.wh_weight
+    , ord_evt.wh_dim
+    , ord_evt.raw_weight
+    , ord_evt.raw_length
+    , ord_evt.raw_width
+    , ord_evt.raw_height
+    , ord_evt.raw_dim
+    , ord_evt.inbound_date
+    , ord_evt.latest_inb_flag
+    , DATE_FORMAT(NOW() + INTERVAL 7 HOUR, '%Y-%m-%d %H:%i') AS datetime_run
+    , GROUP_CONCAT(DISTINCT otn.name) AS order_tags
+    , case
+        when now() >= curdate() - interval 2 hour and i0.created_at >= curdate() - interval 7 hour and i0.created_at <= curdate() + interval 1 day + interval 4 hour then 1
+        when now() < curdate() - interval 2 hour and i0.created_at >= curdate() - interval 7 hour - interval 1 day and i0.created_at <= curdate() + interval 4 hour then 1
+        else 0
+      end as first_inb_flag
+    , date_format(ord_evt.first_glo_inb_datetime + interval 7 hour, '%Y-%m-%d %H:%i:%s') as first_glo_inb_datetime
+from ord_evt
+join (
+    select
+        o.id
+        , o.tracking_id
+        , o.rts
+        , o.status
+        , o.granular_status
+        , o.shipper_id
+        , o.parcel_size_id
+        -- , o.weight AS billing_weight
+        , ABS(CAST(JSON_EXTRACT(o.data, '$.originalDimensions.weight') AS DECIMAL(10,6))) AS sp_weight
+        , ABS(CAST(JSON_EXTRACT(o.data, '$.originalDimensions.length') AS DECIMAL(10,6)))
+          * ABS(CAST(JSON_EXTRACT(o.data, '$.originalDimensions.width') AS DECIMAL(10,6)))
+          * ABS(CAST(JSON_EXTRACT(o.data, '$.originalDimensions.height') AS DECIMAL(10,6))) / 6000 AS sp_dim
+    from orders o
+    where o.id IN (select order_id from wh_ib_raw)
+) o on o.id = ord_evt.order_id
+left join (
+    select
+        id
+        , order_id
+        , created_at
+        , hub_id
+    from hub_prod_gl.scans
+    where hub_country = 'vn'
+        and order_id IN (select order_id from wh_ib_raw)
+) fs on ord_evt.order_id = fs.order_id and ord_evt.created_at > fs.created_at AND fs.hub_id IN (15, 1153, 762, 805, 1226, 1264, 104202)
+left join (
+    select DISTINCT
+          FIRST_VALUE(order_id) OVER(PARTITION BY order_id ORDER BY created_at) as order_id
+        , FIRST_VALUE(created_at) OVER(PARTITION BY order_id ORDER BY created_at) as created_at
+    from inbound_scans
+    where type = 2 and hub_id = 12 and route_id is null
+    and order_id IN (select order_id from wh_ib_raw)
+) i0 on ord_evt.order_id = i0.order_id
+LEFT JOIN order_tags ot ON ord_evt.order_id = ot.order_id
+LEFT JOIN order_tag_names otn ON ot.tag_id = otn.id
+group by ord_evt.order_id, ord_evt.created_at
