@@ -1,0 +1,128 @@
+with
+hubs as
+(
+    select
+          h.hub_id
+        , h.name
+        , @region_id :=
+            case when h.name LIKE 'QUB%' or h.name LIKE 'QUT%' or h.name LIKE 'TTH%' then 103 else h.region_id end as region_id
+        , @local_bus_flag := COALESCE(lb.local_bus_flag, 0) as local_bus_flag
+        , @province := SUBSTRING_INDEX(h.name, ' - ', 1) AS province
+        , @dest_sector :=
+          CASE
+            WHEN @province = "HCM" THEN "HCM"
+            WHEN @province = "HN" THEN "HN"
+            WHEN @province IN ('HAT','NGA','QUB','QUT','THH','TTH') THEN "BTB"
+            WHEN @province IN ('BAG','BAK','CAB','HAG','LAS','THN','TUQ') THEN "DBB"
+            WHEN @province IN ('BN','HAN','HD','HP','HY','NAD','NIB','QUN','THB','VIP') THEN "DBSH"
+            WHEN @province IN ('DIB','HOB','LAC','LCA','PTH','SOL','YEB') THEN "TBB"
+            WHEN @province IN ('BD','BIP','BIT','DN','LA','TAN','VT') THEN "DNB"
+            WHEN @province IN ('ANG','BAL','BET','CAM','CT','DOT','HGI','KIG','SOT','TG','TRV','VIL') THEN "MT"
+            WHEN @province IN ('BID','DAK','DAN','DNG','GIL','KHH','KOT','LAD','NIT','PHY','QNG','QUA') THEN "MTTN"
+            ELSE "OOZ"
+          END AS dest_sector
+        , @outbound_route :=
+            case    when h.hub_id = 1 then 'Holding - OOZ'
+                    when h.hub_id in (1111,1200,103844,104144) then 'Holding Overcap'
+                    when h.hub_id = 1102 then 'Sorting - SORT 3'
+                    when h.hub_id = 70 then 'Outbound - HN Reco'
+                    when @region_id = 89 then 'Outbound - HN'
+                    when @region_id = 101 then IF(@local_bus_flag = 1, 'Outbound - Local Bus', 'Outbound - Inhouse')
+                    when @region_id in (91, 103) then 'Outbound - Interzone'
+            end as outbound_route
+        , CASE
+            WHEN h.name like 'HCM - Recovery - SOU' then 'Outbound - Reco'
+            WHEN h.name in ('HOLDING OVERCAP - SOUTH', 'HOLDING OVERCAP - HCM') THEN 'Outbound - Holding'
+            WHEN h.name in ('HCM - Zone 18 - SOU', 'HCM - Zone 22 - SOU') then 'Outbound - Offload'
+            WHEN trim(substr(h.name,1,3)) IN ('HN','KHH','DNG','DAK','NGA','GIL') THEN 'Outbound - Interzone'
+            WHEN trim(substr(h.name,1,3)) IN ('HCM') THEN 'Outbound - DPs'
+            ELSE 'Outbound - Stations'
+        END AS outbound_route_hcm
+    from sort_prod_gl.hubs h
+    left join (
+                select hub_id, 1 as local_bus_flag
+                from addressing_prod_gl.zones where system_id = 'vn'
+                and SUBSTRING(short_name, 1, 3) = '2-9'
+                GROUP BY hub_id
+            ) lb on h.hub_id = lb.hub_id
+    where h.system_id = 'vn'
+)
+-- select * from hubs
+
+, list_shipments as
+(
+    select
+          s.id as shipment_id
+        , s.user_id as created_by
+        , s.created_at
+        , s.status
+        , s.comments
+        , s.orig_hub_id
+        , s.dest_hub_id
+    from hub_prod_gl.shipments s
+    where s.orig_hub_country = 'vn' and s.orig_hub_id in (12, 15, 1153)
+    and s.created_at >= curdate() - interval 7 day
+    and s.status = 'Pending'
+)
+-- select * from list_shipments
+
+, shipment_events as
+(
+    select
+          shipment_id
+        , created_at
+        , event
+        , user_id
+        , created_at = max(created_at) over(partition by shipment_id, event) as last_event_flag
+        , created_at = min(created_at) over(partition by shipment_id, event) as first_event_flag
+    from hub_prod_gl.shipment_events
+    where shipment_id in (select shipment_id from list_shipments)
+    and hub_system_id = 'vn'
+)
+-- select * from shipment_events
+
+
+select
+      date_format(now() + interval 7 hour, '%Y-%m-%d %H:%i') as datetime_run
+    , date_format(ls.created_at + interval 7 hour, '%Y-%m-%dT%T') as creation_datetime
+    , ls.created_by
+    , ls.shipment_id
+    , ls.status
+    , ls.comments
+    , ls.orig_hub_id
+    , ls.dest_hub_id
+    , hd.name as dest_hub_name
+    , hd.province as dest_province
+    , hd.dest_sector
+    , case
+        when ls.orig_hub_id = 15 then hd.outbound_route
+        when ls.orig_hub_id = 12 then hd.outbound_route_hcm
+      end as outbound_route
+    , so.order_cnt
+    
+    , date_format(se1.created_at + interval 7 hour, '%Y-%m-%dT%T') as close_datetime
+    , se1.user_id as close_by
+    , date_format(se0.created_at + interval 7 hour, '%Y-%m-%dT%T') as reopen_datetime
+    , se0.user_id as reopen_by
+    , date_format(se2.created_at + interval 7 hour, '%Y-%m-%dT%T') as transit_datetime
+    , se2.user_id as transit_by
+    , date_format(se3.created_at + interval 7 hour, '%Y-%m-%dT%T') as complete_datetime
+    , se3.user_id as complete_by
+    , date_format(se4.created_at + interval 7 hour, '%Y-%m-%dT%T') as cancel_datetime
+    , se4.user_id as cancel_by
+from list_shipments ls
+join hubs hd on ls.dest_hub_id = hd.hub_id
+left join (
+    select
+          shipment_id
+        , COUNT(DISTINCT order_id) as order_cnt
+    from hub_prod_gl.shipment_orders
+    where shipment_id IN (select shipment_id from list_shipments)
+    and order_country = 'vn' and deleted_at is null
+    GROUP BY shipment_id
+    ) so on ls.shipment_id = so.shipment_id
+left join shipment_events se1 on ls.shipment_id = se1.shipment_id and se1.event = 'SHIPMENT_CLOSED' and se1.last_event_flag = 1
+left join shipment_events se0 on ls.shipment_id = se0.shipment_id and se0.event = 'SHIPMENT_REOPENNED' and se0.last_event_flag = 1
+left join shipment_events se2 on ls.shipment_id = se2.shipment_id and se2.event = 'SHIPMENT_VAN_INBOUND' and se2.last_event_flag = 1
+left join shipment_events se3 on ls.shipment_id = se3.shipment_id and se3.event = 'SHIPMENT_HUB_INBOUND' and se3.first_event_flag = 1
+left join shipment_events se4 on ls.shipment_id = se4.shipment_id and se4.event = 'SHIPMENT_CANCELLED' and se4.first_event_flag = 1
